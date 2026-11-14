@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Commission Recount — the prompts</title>
+<style>body{background:#14161b;color:#e8e6e0;font:15px/1.5 ui-monospace,Menlo,Consolas,monospace;max-width:900px;margin:24px auto;padding:0 16px}pre{white-space:pre-wrap}</style>
+</head><body><pre>THE THREE PROMPTS — exactly as sent during the build (Episode 29, The Commission Recount)
+
+=== PROMPT 1 ===
+I pay my garage door sales reps tiered commissions and I think my spreadsheet is paying some of
+them wrong. Attached are two CSVs: one month of deals (deal id, close date, rep, amount, status,
+and a Share % column for split deals) and what I actually paid each rep. Build me a single-file
+web page I can open in my browser that reads both files, works out each rep's commission for the
+month, compares it to what I paid, and shows me who got the wrong amount. No servers, no uploads,
+no accounts — everything runs in the browser.
+
+=== PROMPT 2 ===
+Rebuild it, and this time implement my comp plan exactly as written. The plan:
+
+- A rep's credit for the month is the sum of deal amount times their Share % over the deals
+  COLLECTED that month. Shares on a deal must total exactly 100; if they don't, refuse every row
+  of that deal and say why.
+- Deals with status "pending" were sold but not collected. Set them aside and list them — they
+  are worth nothing yet.
+- A deal with status "refunded" claws back at the same share: it SUBTRACTS amount times Share %
+  from that rep's credit.
+- Commission uses MARGINAL tiers on the month's credit: 4% on the dollars up to and including
+  $40,000, 6% on the dollars above $40,000 up to and including $80,000, and 8% on the dollars
+  above $80,000. Each rate applies only to the dollars inside its band — reaching a tier never
+  changes the rate on the dollars below it. A credit of exactly $40,000 sits entirely in the
+  first band.
+- Negative credit means $0 commission this month.
+- Find every column by its header name, in any order. Refuse any row you cannot read — an amount
+  with letters in it, a status that isn't collected/pending/refunded, a missing rep or deal id,
+  a duplicate row — with the row and a reason. Never guess.
+- Compare each rep's correct commission to the Paid table and show the difference.
+
+=== PROMPT 3 ===
+Before anyone reads the report, make the page audit itself. Rows in must equal checked plus set
+aside plus refused. Add the credited money up two independent ways and compare to the cent. If
+any check fails, or more than ten percent of the rows were refused, or the tier settings make no
+sense, open the report with DO NOT TRUST THIS RECOUNT in red and price nothing. Keep the page a
+single file with zero network requests and zero stored data.
+</pre></body></html>

@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SECOND DRAFT — NOT THE TOOL</title>
+<style>body{background:#1b1416;color:#e8e6e0;font:15px/1.5 ui-monospace,Menlo,Consolas,monospace;max-width:900px;margin:24px auto;padding:0 16px}
+.warn{background:#c23b3b;color:#fff;font-weight:800;padding:10px 14px;border-radius:8px}pre{white-space:pre-wrap}</style>
+</head><body><p class="warn">SECOND DRAFT — NOT THE TOOL</p><p>Prompt 2, the plan given. Looks careful, still wrong three ways: pending deals land in the credit, a refund ADDS instead of subtracting, and split shares are never checked against 100. The referee disagreed on every rep. Kept so you can see what came back. DO NOT USE.</p><pre>// SECOND DRAFT (prompt 2 — the plan given verbatim). Kept as a museum piece: NOT THE TOOL.
+// Looks careful: headers found by name, unreadable amounts and unknown statuses refused,
+// duplicates refused, marginal tiers implemented. The referee still disagreed on every rep.
+// Its three real faults: pending rows are added to credit (while still listed as "set aside"),
+// a refund ADDS at the rep's share instead of subtracting, and split shares are never checked
+// against 100.
+"use strict";
+function parseCSV(text) { // same quoting rules as the final tool
+  const rows = []; let row = [], field = "", inQ = false;
+  const s = String(text || "");
+  for (let i = 0; i &lt; s.length; i++) {
+    const c = s[i];
+    if (inQ) { if (c === '"') { if (s[i + 1] === '"') { field += '"'; i++; } else inQ = false; } else field += c; }
+    else if (c === '"') inQ = true;
+    else if (c === ",") { row.push(field); field = ""; }
+    else if (c === "\n") { row.push(field); rows.push(row); row = []; field = ""; }
+    else if (c === "\r") {}
+    else field += c;
+  }
+  row.push(field);
+  if (row.length > 1 || row[0].trim() !== "") rows.push(row);
+  return rows.filter(r => r.some(x => String(x).trim() !== ""));
+}
+function num(raw) {
+  const s = String(raw ?? "").trim().replace(/[$,\s]/g, "");
+  if (!/^(\d+(\.\d*)?|\.\d+)$/.test(s)) return null;
+  return parseFloat(s);
+}
+function run(dealsText, paidText) {
+  const rows = parseCSV(dealsText);
+  const head = rows[0].map(h => h.trim().toLowerCase());
+  const col = (n) => head.indexOf(n);
+  const iDeal = col("deal"), iRep = col("rep"), iAmt = col("amount"), iSt = col("status"), iShare = col("share %");
+  const refusals = [], parsed = [];
+  for (const r of rows.slice(1)) {
+    const deal = (r[iDeal] || "").trim(), rep = (r[iRep] || "").trim();
+    const status = (r[iSt] || "").trim().toLowerCase();
+    if (!deal) { refusals.push({ deal: "(blank)", rep, reason: "missing deal id" }); continue; }
+    if (!rep) { refusals.push({ deal, rep: "(blank)", reason: "missing rep" }); continue; }
+    const amt = num(r[iAmt]);
+    if (amt === null) { refusals.push({ deal, rep, reason: "unreadable amount" }); continue; }
+    if (!["collected", "pending", "refunded"].includes(status)) { refusals.push({ deal, rep, reason: "unknown status" }); continue; }
+    const shareRaw = iShare === -1 ? "" : String(r[iShare] ?? "").trim();
+    const share = shareRaw === "" ? 100 : (num(shareRaw) ?? 0);
+    parsed.push({ deal, rep, amt, status, share });
+  }
+  const seen = new Set();
+  const dup = new Set();
+  for (const p of parsed) { const k = p.deal + "|" + p.rep; if (seen.has(k)) dup.add(p.deal); seen.add(k); }
+  const credit = {}, setAside = [];
+  for (const p of parsed) {
+    if (dup.has(p.deal)) { refusals.push({ deal: p.deal, rep: p.rep, reason: "duplicate deal row" }); continue; }
+    const contrib = p.amt * p.share / 100;
+    if (p.status === "pending") setAside.push({ deal: p.deal, rep: p.rep, value: contrib });
+    // FAULT 1+2: pending still lands in credit; a refund is "taken back" with a double negative
+    const signed = p.status === "refunded" ? -(-contrib) : contrib;
+    credit[p.rep] = (credit[p.rep] || 0) + signed;
+  }
+  const paid = {};
+  const prows = parseCSV(paidText);
+  const ph = prows[0].map(h => h.trim().toLowerCase());
+  for (const r of prows.slice(1)) {
+    const rep = (r[ph.indexOf("rep")] || "").trim();
+    if (rep) paid[rep] = (paid[rep] || 0) + (num(r[ph.indexOf("paid")]) ?? 0);
+  }
+  const out = [];
+  for (const rep of Object.keys(credit)) {
+    const C = credit[rep];
+    const b1 = Math.min(C, 40000), b2 = Math.min(Math.max(C - 40000, 0), 40000), b3 = Math.max(C - 80000, 0);
+    const due = Math.round((b1 * 0.04 + b2 * 0.06 + b3 * 0.08) * 100) / 100;
+    const p = paid[rep] ?? 0;
+    out.push({ rep, credit: Math.round(C * 100) / 100, due, paid: p, delta: Math.round((p - due) * 100) / 100 });
+  }
+  out.sort((a, b) => a.rep.localeCompare(b.rep));
+  return { reps: out, setAside, refusals };
+}
+if (typeof module !== "undefined") module.exports = { run };
+</pre></body></html>

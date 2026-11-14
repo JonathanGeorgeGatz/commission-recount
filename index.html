@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Commission Recount — free commission audit tool</title>
+<style>
+  :root { --bg:#14161b; --panel:#1d2026; --ink:#e8e6e0; --dim:#9aa0a8; --accent:#7A2E3F; --accent2:#5C7A3B; --warn:#c23b3b; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:16px/1.5 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; padding:16px; }
+  .wrap { max-width:1100px; margin:0 auto; }
+  h1 { font-size:1.6rem; margin:.2em 0 0; }
+  .sub { color:var(--dim); margin:0 0 1em; }
+  .cols { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  .cols .full { grid-column:1 / -1; }
+  @media (max-width:800px){ .cols{grid-template-columns:1fr;} }
+  .card { background:var(--panel); border:1px solid #2a2e36; border-radius:10px; padding:12px 14px; }
+  label { display:block; font-weight:600; margin-bottom:6px; }
+  textarea { width:100%; min-height:150px; background:#121419; color:var(--ink); border:1px solid #2a2e36; border-radius:8px; padding:8px; font:13px/1.45 ui-monospace,Menlo,Consolas,monospace; white-space:pre; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:8px; padding:10px 18px; font-size:1rem; font-weight:600; cursor:pointer; margin:14px 8px 0 0; }
+  button.ghost { background:#2a2e36; }
+  .banner { background:var(--warn); color:#fff; font-weight:800; font-size:1.25rem; padding:12px 16px; border-radius:10px; margin:16px 0 8px; }
+  .reasons { color:#f0b9b9; margin:0 0 12px; }
+  table { border-collapse:collapse; width:100%; margin:10px 0; }
+  th,td { text-align:left; padding:6px 10px; border-bottom:1px solid #2a2e36; font-variant-numeric:tabular-nums; }
+  th { color:var(--dim); font-weight:600; }
+  td.num,th.num { text-align:right; }
+  .over { color:#e4a2a2; } .under { color:#a2c7e4; } .zero { color:var(--accent2); }
+  h2 { font-size:1.1rem; margin:1.2em 0 .3em; }
+  .note { color:var(--dim); font-size:.9rem; }
+  .fict { display:inline-block; background:#2a2e36; color:var(--dim); border-radius:6px; padding:2px 8px; font-size:.8rem; margin-left:8px; }
+  #report:empty { display:none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>The Commission Recount</h1>
+  <p class="sub">Paste one month of deals, your comp plan tiers, and what you actually paid.
+  It recomputes every rep's commission with marginal tiers — splits, pending set aside, refunds
+  clawed back at the rep's share — and shows who was overpaid and who was shorted.
+  Runs entirely in your browser; nothing is sent anywhere.
+  <span class="fict">sample data is fictional</span></p>
+
+  <div class="cols">
+    <div class="card"><label for="deals">Deals (CSV: Deal, Rep, Amount, Status, Share %)</label>
+      <textarea id="deals" spellcheck="false"></textarea></div>
+    <div class="card"><label for="paid">Paid (CSV: Rep, Paid)</label>
+      <textarea id="paid" spellcheck="false"></textarea>
+      <label for="settings" style="margin-top:12px">Settings (optional)</label>
+      <textarea id="settings" spellcheck="false" style="min-height:90px"></textarea></div>
+  </div>
+  <button id="runBtn">Run the recount</button>
+  <button id="sampleBtn" class="ghost">Load the sample month</button>
+  <div id="report" class="card full" style="margin-top:16px"></div>
+  <p class="note">Rules, prompts, the Python referee and the two failed drafts are in the
+  download folder next to this page. The plan this tool implements is written in SPEC.md.</p>
+</div>
+<script>
+// The Commission Recount — engine (pure; no network, no storage, no dates).
+// Exact arithmetic: every money value is a Frac (BigInt n / BigInt d); cents rounded half-up ONCE.
+"use strict";
+
+// ---------- exact fractions ----------
+function frac(n, d) { if (d < 0n) { n = -n; d = -d; } return { n, d }; }
+const F0 = frac(0n, 1n);
+function fAdd(a, b) { return frac(a.n * b.d + b.n * a.d, a.d * b.d); }
+function fSub(a, b) { return frac(a.n * b.d - b.n * a.d, a.d * b.d); }
+function fMul(a, b) { return frac(a.n * b.n, a.d * b.d); }
+function fCmp(a, b) { const l = a.n * b.d, r = b.n * a.d; return l < r ? -1 : l > r ? 1 : 0; }
+function fMin(a, b) { return fCmp(a, b) <= 0 ? a : b; }
+function fMax(a, b) { return fCmp(a, b) >= 0 ? a : b; }
+function fNeg(a) { return frac(-a.n, a.d); }
+// round to cents, half up (ties away from zero) -> integer cents (BigInt)
+function fCents(a) {
+  const neg = a.n < 0n;
+  const n = neg ? -a.n : a.n;
+  const num = n * 100n;
+  let q = num / a.d;
+  const r = num - q * a.d;
+  if (r * 2n >= a.d) q += 1n;
+  return neg ? -q : q;
+}
+function centsStr(c) {
+  const neg = c < 0n; if (neg) c = -c;
+  const w = c / 100n, f = (c % 100n).toString().padStart(2, "0");
+  return (neg ? "-" : "") + w.toString() + "." + f;
+}
+
+// ---------- parsing ----------
+// plain decimal: digits with at most one dot (at least one digit somewhere)
+function parseDec(raw, allowNeg) {
+  if (raw === null || raw === undefined) return null;
+  let s = String(raw).trim().replace(/[$,\s]/g, "");
+  if (s === "") return null;
+  let neg = false;
+  if (allowNeg && (s[0] === "-" || s[0] === "+")) { neg = s[0] === "-"; s = s.slice(1); }
+  if (!/^(\d+(\.\d*)?|\.\d+)$/.test(s)) return null;
+  const dot = s.indexOf(".");
+  const digits = dot === -1 ? s : s.slice(0, dot) + s.slice(dot + 1);
+  const scale = dot === -1 ? 0 : s.length - dot - 1;
+  let n = BigInt(digits === "" ? "0" : digits);
+  if (neg) n = -n;
+  return frac(n, 10n ** BigInt(scale));
+}
+
+// CSV: quoted fields may contain commas and doubled quotes; rows split on \r?\n
+function parseCSV(text) {
+  const rows = []; let row = [], field = "", inQ = false;
+  const s = String(text || "");
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (inQ) {
+      if (c === '"') { if (s[i + 1] === '"') { field += '"'; i++; } else inQ = false; }
+      else field += c;
+    } else if (c === '"') inQ = true;
+    else if (c === ",") { row.push(field); field = ""; }
+    else if (c === "\n") { row.push(field); rows.push(row); row = []; field = ""; }
+    else if (c === "\r") { /* skip */ }
+    else field += c;
+  }
+  row.push(field);
+  if (row.length > 1 || row[0].trim() !== "") rows.push(row);
+  return rows.filter(r => r.some(x => String(x).trim() !== ""));
+}
+
+function headerIndex(headerRow, wanted) {
+  const idx = {};
+  headerRow.forEach((h, i) => { idx[String(h).trim().toLowerCase()] = i; });
+  const out = {};
+  for (const w of wanted) out[w] = (w in idx || idx[w] !== undefined) ? idx[w] : undefined;
+  for (const w of wanted) out[w] = idx[w];
+  return out;
+}
+
+// ---------- the recount ----------
+function run(dealsText, paidText, settingsText) {
+  const bannerReasons = [];
+  const refusals = [];       // {deal, rep, reason}
+  const report = {};
+
+  // Settings
+  const defaults = { tier1_up_to: "40000", tier1_rate: "4", tier2_up_to: "80000", tier2_rate: "6", tier3_rate: "8" };
+  const known = Object.keys(defaults);
+  const setVals = {};
+  let settingsInvalid = false;
+  const sRows = parseCSV(settingsText || "");
+  if (sRows.length) {
+    const h = headerIndex(sRows[0], ["setting", "value"]);
+    if (h.setting === undefined || h.value === undefined) settingsInvalid = true;
+    else for (const r of sRows.slice(1)) {
+      const name = String(r[h.setting] ?? "").trim().toLowerCase();
+      if (!known.includes(name)) continue;
+      const v = parseDec(r[h.value], false);
+      if (v === null) { settingsInvalid = true; break; }
+      setVals[name] = v;
+    }
+  }
+  const tiers = {};
+  if (!settingsInvalid) {
+    for (const k of known) tiers[k] = setVals[k] !== undefined ? setVals[k] : parseDec(defaults[k], false);
+    if (!(fCmp(tiers.tier1_up_to, tiers.tier2_up_to) < 0) ||
+        !(fCmp(tiers.tier1_up_to, F0) > 0) || !(fCmp(tiers.tier2_up_to, F0) > 0) ||
+        fCmp(tiers.tier1_rate, F0) < 0 || fCmp(tiers.tier2_rate, F0) < 0 || fCmp(tiers.tier3_rate, F0) < 0)
+      settingsInvalid = true;
+  }
+  if (settingsInvalid) bannerReasons.push("settings invalid");
+
+  // Deals
+  const dRows = parseCSV(dealsText || "");
+  let rowsIn = 0, checkedRows = [], setAsideRows = [];
+  let dealsHeaderOK = false;
+  if (dRows.length) {
+    const h = headerIndex(dRows[0], ["deal", "rep", "amount", "status", "share %"]);
+    if (h.deal !== undefined && h.rep !== undefined && h.amount !== undefined && h.status !== undefined) {
+      dealsHeaderOK = true;
+      const parsed = [];
+      for (const r of dRows.slice(1)) {
+        rowsIn++;
+        const deal = String(r[h.deal] ?? "").trim();
+        const rep = String(r[h.rep] ?? "").trim();
+        const rawAmount = r[h.amount];
+        const status = String(r[h.status] ?? "").trim().toLowerCase();
+        const rawShare = h["share %"] === undefined ? "" : String(r[h["share %"]] ?? "").trim();
+        if (deal === "") { refusals.push({ deal: "(blank)", rep: rep || "(blank)", reason: "missing deal id" }); continue; }
+        if (rep === "") { refusals.push({ deal, rep: "(blank)", reason: "missing rep" }); continue; }
+        const amount = parseDec(rawAmount, false);
+        if (amount === null) { refusals.push({ deal, rep, reason: "unreadable amount" }); continue; }
+        if (!["collected", "pending", "refunded"].includes(status)) { refusals.push({ deal, rep, reason: "unknown status" }); continue; }
+        let share;
+        if (rawShare === "") share = frac(100n, 1n);
+        else {
+          share = parseDec(rawShare, false);
+          if (share === null || !(fCmp(share, F0) > 0) || fCmp(share, frac(100n, 1n)) > 0) {
+            refusals.push({ deal, rep, reason: "unreadable share" }); continue;
+          }
+        }
+        parsed.push({ deal, rep, amount, amountRaw: String(rawAmount).trim(), status, share });
+      }
+      // deal-level checks
+      const byDeal = new Map();
+      for (const p of parsed) { if (!byDeal.has(p.deal)) byDeal.set(p.deal, []); byDeal.get(p.deal).push(p); }
+      for (const [deal, rows] of byDeal) {
+        const seenRep = new Map();
+        let reason = null;
+        for (const p of rows) {
+          if (seenRep.has(p.rep)) { reason = "duplicate deal row"; break; }
+          seenRep.set(p.rep, 1);
+        }
+        if (!reason && rows.some(p => fCmp(p.amount, rows[0].amount) !== 0)) reason = "conflicting amounts";
+        if (!reason && rows.some(p => p.status !== rows[0].status)) reason = "conflicting statuses";
+        if (!reason) {
+          let sum = F0; rows.forEach(p => { sum = fAdd(sum, p.share); });
+          if (fCmp(sum, frac(100n, 1n)) !== 0) reason = "shares do not total 100";
+        }
+        if (reason) { rows.forEach(p => refusals.push({ deal, rep: p.rep, reason })); }
+        else for (const p of rows) (p.status === "pending" ? setAsideRows : checkedRows).push(p);
+      }
+    } else bannerReasons.push("header row unreadable: Deals");
+  } else bannerReasons.push("header row unreadable: Deals");
+
+  // Paid
+  const pRows = parseCSV(paidText || "");
+  const paidByRep = new Map();
+  if (pRows.length) {
+    const h = headerIndex(pRows[0], ["rep", "paid"]);
+    if (h.rep !== undefined && h.paid !== undefined) {
+      for (const r of pRows.slice(1)) {
+        const rep = String(r[h.rep] ?? "").trim();
+        if (rep === "") { refusals.push({ deal: "(paid)", rep: "(blank)", reason: "missing rep" }); continue; }
+        const v = parseDec(r[h.paid], true);
+        if (v === null) { refusals.push({ deal: "(paid)", rep, reason: "unreadable paid amount" }); continue; }
+        paidByRep.set(rep, fAdd(paidByRep.get(rep) || F0, v));
+      }
+    } else bannerReasons.push("header row unreadable: Paid");
+  } else bannerReasons.push("header row unreadable: Paid");
+
+  // Credit per rep (checked rows; refunded subtracts)
+  const creditByRep = new Map();
+  for (const p of checkedRows) {
+    const contrib = fMul(p.amount, fMul(p.share, frac(1n, 100n)));
+    const signed = p.status === "refunded" ? fNeg(contrib) : contrib;
+    creditByRep.set(p.rep, fAdd(creditByRep.get(p.rep) || F0, signed));
+  }
+
+  // Commission (marginal)
+  function commission(C) {
+    if (settingsInvalid) return F0;
+    if (fCmp(C, F0) <= 0) return F0;
+    const t1 = tiers.tier1_up_to, t2 = tiers.tier2_up_to;
+    const b1 = fMin(C, t1);
+    const b2 = fMin(fMax(fSub(C, t1), F0), fSub(t2, t1));
+    const b3 = fMax(fSub(C, t2), F0);
+    let c = fMul(b1, fMul(tiers.tier1_rate, frac(1n, 100n)));
+    c = fAdd(c, fMul(b2, fMul(tiers.tier2_rate, frac(1n, 100n))));
+    c = fAdd(c, fMul(b3, fMul(tiers.tier3_rate, frac(1n, 100n))));
+    return fMax(c, F0);
+  }
+
+  // Per-rep table
+  const repNames = new Set([...creditByRep.keys(), ...paidByRep.keys()]);
+  const reps = [];
+  for (const rep of repNames) {
+    const C = creditByRep.get(rep) || F0;
+    const due = commission(C);
+    const dueC = fCents(due);
+    const creditC = fCents(C);
+    const hasPaid = paidByRep.has(rep);
+    const paidC = hasPaid ? fCents(paidByRep.get(rep)) : null;
+    const deltaC = hasPaid ? paidC - dueC : null;
+    reps.push({ rep, credit: centsStr(creditC), commission: centsStr(dueC),
+      paid: hasPaid ? centsStr(paidC) : null, delta: hasPaid ? centsStr(deltaC) : null,
+      _abs: deltaC === null ? -1n : (deltaC < 0n ? -deltaC : deltaC) });
+  }
+  reps.sort((a, b) => (a._abs === b._abs ? (a.rep < b.rep ? -1 : a.rep > b.rep ? 1 : 0) : (a._abs > b._abs ? -1 : 1)));
+  reps.forEach(r => delete r._abs);
+
+  // Totals
+  let dueT = 0n, paidT = 0n, overT = 0n, underT = 0n;
+  for (const r of reps) {
+    dueT += BigInt(Math.round(0)) + centsOf(r.commission);
+    if (r.paid !== null) {
+      paidT += centsOf(r.paid);
+      const d = centsOf(r.delta);
+      if (d > 0n) overT += d; else underT += -d;
+    }
+  }
+  function centsOf(s) {
+    const neg = s[0] === "-"; const t = neg ? s.slice(1) : s;
+    const [w, f] = t.split(".");
+    const c = BigInt(w) * 100n + BigInt(f);
+    return neg ? -c : c;
+  }
+
+  // Audit: cross-foot (independent pass over checked rows)
+  let cross = F0;
+  for (const p of checkedRows) {
+    const contrib = fMul(p.amount, fMul(p.share, frac(1n, 100n)));
+    cross = fAdd(cross, p.status === "refunded" ? fNeg(contrib) : contrib);
+  }
+  let creditSum = F0;
+  for (const C of creditByRep.values()) creditSum = fAdd(creditSum, C);
+  if (fCents(cross) !== fCents(creditSum)) bannerReasons.push("money cross-foot failed");
+  if (dealsHeaderOK && rowsIn !== checkedRows.length + setAsideRows.length + refusals.filter(r => r.deal !== "(paid)").length)
+    bannerReasons.push("row count arithmetic failed");
+  const dealRefused = refusals.filter(r => r.deal !== "(paid)").length;
+  if (dealsHeaderOK && rowsIn > 0 && dealRefused * 10 > rowsIn) bannerReasons.push("more than 10% of rows refused");
+
+  const banner = bannerReasons.length > 0;
+  const sortedRefusals = refusals.slice().sort((a, b) =>
+    a.deal === b.deal ? (a.rep === b.rep ? (a.reason < b.reason ? -1 : 1) : (a.rep < b.rep ? -1 : 1)) : (a.deal < b.deal ? -1 : 1));
+  const setAside = setAsideRows.map(p => ({ deal: p.deal, rep: p.rep,
+    value: centsStr(fCents(fMul(p.amount, fMul(p.share, frac(1n, 100n))))) }))
+    .sort((a, b) => a.deal === b.deal ? (a.rep < b.rep ? -1 : 1) : (a.deal < b.deal ? -1 : 1));
+
+  report.banner = banner;
+  report.bannerText = banner ? "DO NOT TRUST THIS RECOUNT" : "";
+  report.bannerReasons = bannerReasons.slice().sort();
+  report.counts = { rowsIn, checked: checkedRows.length, setAside: setAsideRows.length, refused: dealRefused };
+  report.reps = banner ? [] : reps;
+  report.totals = banner ? null : { due: centsStr(dueT), paid: centsStr(paidT), over: centsStr(overT), under: centsStr(underT) };
+  report.setAside = banner ? [] : setAside;
+  report.refusals = sortedRefusals;
+  report.tiers = settingsInvalid ? null : {
+    tier1_up_to: centsStr(fCents(tiers.tier1_up_to)), tier1_rate: fRateStr(tiers.tier1_rate),
+    tier2_up_to: centsStr(fCents(tiers.tier2_up_to)), tier2_rate: fRateStr(tiers.tier2_rate),
+    tier3_rate: fRateStr(tiers.tier3_rate) };
+  return report;
+
+  function fRateStr(f) { // rates shown to 4 dp max, trailing zeros trimmed
+    const c = (() => { const neg = f.n < 0n; let n = neg ? -f.n : f.n; const num = n * 10000n;
+      let q = num / f.d; const r = num - q * f.d; if (r * 2n >= f.d) q += 1n; return neg ? -q : q; })();
+    let s = (c < 0n ? "-" : "") + (c < 0n ? -c : c).toString().padStart(5, "0");
+    s = s.slice(0, -4) + "." + s.slice(-4);
+    return s.replace(/\.?0+$/, "");
+  }
+}
+
+if (typeof module !== "undefined") module.exports = { run, parseCSV, parseDec };
+if (typeof window !== "undefined") window.CommissionRecount = { run };
+
+</script>
+<script>
+const SAMPLE_DEALS = "Deal,Closed,Rep,Amount,Status,Share %\nD-7301,2026-10-02,Tom Garza,4850.00,collected,\nD-7302,2026-10-03,Leah Whitfield,1650.00,collected,\nD-7303,2026-10-04,Tom Garza,3400.00,collected,\nD-7304,2026-10-05,Dana Kowalski,3110.00,collected,\nD-7305,2026-10-06,Priya Natarajan,1850.00,collected,\nD-7306,2026-10-07,Tom Garza,6700.00,collected,\nD-7307,2026-10-08,Marcus Reed,980.00,collected,\nD-7308,2026-10-09,Priya Natarajan,980.00,collected,\nD-7309,2026-10-10,Priya Natarajan,6800.00,collected,\nD-7310,2026-10-11,Tom Garza,2340.00,collected,\nD-7311,2026-10-12,Dana Kowalski,1760.00,collected,\nD-7312,2026-10-13,Tom Garza,890.00,collected,\nD-7313,2026-10-14,Dana Kowalski,2250.00,collected,\nD-7314,2026-10-15,Dana Kowalski,4870.00,collected,\nD-7315,2026-10-16,Leah Whitfield,990.00,collected,\nD-7316,2026-10-17,Dana Kowalski,2640.00,collected,\nD-7317,2026-10-18,Marcus Reed,4680.00,collected,\nD-7318,2026-10-19,Leah Whitfield,1480.00,collected,\nD-7319,2026-10-20,Marcus Reed,7300.00,collected,\nD-7320,2026-10-21,Marcus Reed,1870.00,collected,\nD-7321,2026-10-22,Leah Whitfield,1680.00,collected,\nD-7322,2026-10-23,Priya Natarajan,9150.00,collected,\nD-7323,2026-10-24,Dana Kowalski,1100.00,collected,\nD-7324,2026-10-25,Tom Garza,2750.00,collected,\nD-7325,2026-10-26,Priya Natarajan,620.00,collected,\nD-7326,2026-10-27,Dana Kowalski,1980.00,collected,\nD-7327,2026-10-28,Marcus Reed,2950.00,collected,\nD-7328,2026-10-02,Tom Garza,1980.00,collected,\nD-7329,2026-10-03,Dana Kowalski,1210.00,collected,\nD-7330,2026-10-04,Dana Kowalski,4120.00,collected,\nD-7331,2026-10-05,Priya Natarajan,3250.00,collected,\nD-7332,2026-10-06,Marcus Reed,22750.00,collected,\nD-7333,2026-10-07,Marcus Reed,9850.00,collected,\nD-7334,2026-10-08,Marcus Reed,1510.00,collected,\nD-7335,2026-10-09,Tom Garza,8300.00,collected,\nD-7336,2026-10-10,Dana Kowalski,3650.00,collected,\nD-7337,2026-10-11,Marcus Reed,1420.00,collected,\nD-7338,2026-10-12,Tom Garza,2100.00,collected,\nD-7339,2026-10-13,Marcus Reed,18400.00,collected,\nD-7340,2026-10-14,Leah Whitfield,3950.00,collected,\nD-7341,2026-10-15,Marcus Reed,1430.00,collected,\nD-7342,2026-10-16,Priya Natarajan,1430.00,collected,\nD-7343,2026-10-17,Priya Natarajan,8900.00,collected,\nD-7344,2026-10-18,Tom Garza,1530.00,collected,\nD-7345,2026-10-19,Dana Kowalski,2890.00,collected,\nD-7346,2026-10-20,Priya Natarajan,2600.00,collected,\nD-7347,2026-10-21,Leah Whitfield,1340.00,collected,\nD-7348,2026-10-22,Leah Whitfield,760.00,collected,\nD-7349,2026-10-23,Marcus Reed,760.00,collected,\nD-7350,2026-10-24,Leah Whitfield,2800.00,collected,\nD-7351,2026-10-25,Dana Kowalski,1540.00,collected,\nD-7352,2026-10-26,Dana Kowalski,3480.00,collected,\nD-7353,2026-10-27,Priya Natarajan,570.00,collected,\nD-7354,2026-10-28,Marcus Reed,15900.00,collected,\nD-7355,2026-10-02,Tom Garza,1160.00,collected,\nD-7356,2026-10-03,Priya Natarajan,11250.00,collected,\nD-7462,2026-10-09,Dana Kowalski,9000.00,collected,60\nD-7462,2026-10-09,Leah Whitfield,9000.00,collected,40\nD-7455,2026-10-13,Marcus Reed,12700.00,collected,50\nD-7455,2026-10-13,Priya Natarajan,12700.00,collected,50\nD-7421,2026-10-17,Tom Garza,9400.00,refunded,50\nD-7421,2026-10-17,Marcus Reed,9400.00,refunded,50\nD-7470,2026-10-24,Dana Kowalski,3850.00,pending,\nD-7472,2026-10-26,Priya Natarajan,7200.00,pending,\nD-7468,2026-10-27,Leah Whitfield,4950.00,pending,\nD-7475,2026-10-28,Leah Whitfield,2300.00,pending,\nD-7488,2026-10-20,Marcus Reed,5800.00,collected,\nD-7488,2026-10-20,Marcus Reed,5800.00,collected,\nD-7512,2026-10-22,Priya Natarajan,8400.00,collected,60\nD-7512,2026-10-22,Leah Whitfield,8400.00,collected,50\nD-7519,2026-10-23,Tom Garza,\"4,800 USD\",collected,\nD-7523,2026-10-25,Dana Kowalski,6200.00,invoiced,\nD-7530,2026-10-29,,3100.00,collected,\n";
+const SAMPLE_PAID = "Rep,Paid\nDana Kowalski,2400.00\nMarcus Reed,7692.00\nPriya Natarajan,3225.00\nTom Garza,1064.00\nLeah Whitfield,730.00\n";
+const SAMPLE_SETTINGS = "Setting,Value\ntier1_up_to,40000\ntier1_rate,4\ntier2_up_to,80000\ntier2_rate,6\ntier3_rate,8\n";
+const $ = (id) => document.getElementById(id);
+function esc(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function money(s){ return s === null ? "—" : "$" + s.replace(/^(-?)(\d+)/, (m,g1,g2)=>g1+g2.replace(/\B(?=(\d{3})+(?!\d))/g, ",")); }
+function render(rep){
+  let h = "";
+  if (rep.banner) {
+    h += '<div class="banner">' + esc(rep.bannerText) + '</div>';
+    h += '<p class="reasons">' + rep.bannerReasons.map(esc).join(" · ") + '</p>';
+  }
+  h += '<h2>Counts</h2><p>' + rep.counts.rowsIn + ' deal rows in = ' + rep.counts.checked +
+       ' checked + ' + rep.counts.setAside + ' set aside + ' + rep.counts.refused + ' refused</p>';
+  if (!rep.banner) {
+    h += '<h2>Per rep</h2><table><tr><th>Rep</th><th class="num">Credited revenue</th><th class="num">Commission due</th><th class="num">Paid</th><th class="num">Delta (paid − due)</th></tr>';
+    for (const r of rep.reps) {
+      const cls = r.delta === null ? "" : (r.delta.startsWith("-") ? "under" : (r.delta === "0.00" ? "zero" : "over"));
+      h += '<tr><td>' + esc(r.rep) + '</td><td class="num">' + money(r.credit) + '</td><td class="num">' + money(r.commission) +
+           '</td><td class="num">' + (r.paid === null ? "no payment row" : money(r.paid)) + '</td><td class="num ' + cls + '">' + money(r.delta) + '</td></tr>';
+    }
+    h += '</table>';
+    h += '<h2>Totals</h2><p>Due ' + money(rep.totals.due) + ' · paid ' + money(rep.totals.paid) +
+         ' · overpaid ' + money(rep.totals.over) + ' · underpaid ' + money(rep.totals.under) + '</p>';
+    if (rep.setAside.length) {
+      h += '<h2>Set aside (pending — worth nothing yet)</h2><table><tr><th>Deal</th><th>Rep</th><th class="num">Would credit</th></tr>';
+      for (const s of rep.setAside) h += '<tr><td>' + esc(s.deal) + '</td><td>' + esc(s.rep) + '</td><td class="num">' + money(s.value) + '</td></tr>';
+      h += '</table>';
+    }
+  }
+  if (rep.refusals.length) {
+    h += '<h2>Refused rows</h2><table><tr><th>Deal</th><th>Rep</th><th>Reason</th></tr>';
+    for (const f of rep.refusals) h += '<tr><td>' + esc(f.deal) + '</td><td>' + esc(f.rep) + '</td><td>' + esc(f.reason) + '</td></tr>';
+    h += '</table>';
+  }
+  if (rep.tiers) {
+    h += '<h2>Tiers used</h2><p class="note">up to ' + money(rep.tiers.tier1_up_to) + ' at ' + esc(rep.tiers.tier1_rate) +
+         '% · then up to ' + money(rep.tiers.tier2_up_to) + ' at ' + esc(rep.tiers.tier2_rate) +
+         '% · above that at ' + esc(rep.tiers.tier3_rate) + '% — each rate only on the dollars inside its band</p>';
+  }
+  $("report").innerHTML = h;
+}
+$("runBtn").addEventListener("click", () => {
+  render(window.CommissionRecount.run($("deals").value, $("paid").value, $("settings").value));
+});
+$("sampleBtn").addEventListener("click", () => {
+  $("deals").value = SAMPLE_DEALS; $("paid").value = SAMPLE_PAID; $("settings").value = SAMPLE_SETTINGS;
+});
+</script>
+</body>
+</html>

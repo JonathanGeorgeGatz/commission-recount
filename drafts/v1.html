@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FIRST DRAFT — NOT THE TOOL</title>
+<style>body{background:#1b1416;color:#e8e6e0;font:15px/1.5 ui-monospace,Menlo,Consolas,monospace;max-width:900px;margin:24px auto;padding:0 16px}
+.warn{background:#c23b3b;color:#fff;font-weight:800;padding:10px 14px;border-radius:8px}pre{white-space:pre-wrap}</style>
+</head><body><p class="warn">FIRST DRAFT — NOT THE TOOL</p><p>Prompt 1, no plan given. It counts pending and refunded deals as revenue, applies the tier you END at to every dollar, pays a commission to a rep with no name, and one comma turns a whole rep's line into NaN. Kept so you can see what came back. DO NOT USE.</p><pre>// FIRST DRAFT (prompt 1 — no plan given). Kept as a museum piece: NOT THE TOOL.
+// Naive choices a first build actually makes: every row is revenue (pending and refunded
+// included, refunds ADD), parseFloat stops at the first letter, no validation of splits or
+// duplicates, and the tier you END at is applied to EVERYTHING (retroactive misreading).
+"use strict";
+function parseCSVSimple(text) {
+  return String(text || "").split(/\r?\n/).filter(l => l.trim()).map(l => l.split(","));
+}
+function run(dealsText, paidText) {
+  const rows = parseCSVSimple(dealsText);
+  const head = rows[0].map(h => h.trim().toLowerCase());
+  const col = (n) => head.indexOf(n);
+  const iRep = col("rep"), iAmt = col("amount"), iShare = col("share %");
+  const credit = {};
+  for (const r of rows.slice(1)) {
+    const rep = (r[iRep] || "").trim();
+    const amt = parseFloat((r[iAmt] || "").replace(/[$,"]/g, "")) || 0;
+    const share = r[iShare] &amp;&amp; r[iShare].trim() !== "" ? parseFloat(r[iShare]) : 100;
+    credit[rep] = (credit[rep] || 0) + amt * share / 100;
+  }
+  const paid = {};
+  const prows = parseCSVSimple(paidText);
+  const ph = prows[0].map(h => h.trim().toLowerCase());
+  for (const r of prows.slice(1)) paid[(r[ph.indexOf("rep")] || "").trim()] = parseFloat(r[ph.indexOf("paid")]) || 0;
+  const out = [];
+  for (const rep of Object.keys(credit)) {
+    const C = credit[rep];
+    const rate = C >= 80000 ? 0.08 : C >= 40000 ? 0.06 : 0.04; // "you reached the tier, you get the rate"
+    const due = Math.round(C * rate * 100) / 100;
+    const p = paid[rep] ?? 0;
+    out.push({ rep, credit: Math.round(C * 100) / 100, due, paid: p, delta: Math.round((p - due) * 100) / 100 });
+  }
+  out.sort((a, b) => a.rep.localeCompare(b.rep));
+  return out;
+}
+if (typeof module !== "undefined") module.exports = { run };
+</pre></body></html>
